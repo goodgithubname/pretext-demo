@@ -1,0 +1,413 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Rope Text</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    html, body {
+      width: 100%;
+      height: 100%;
+      background: #f5f2ee;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    #canvas {
+      display: block;
+      background: #ffffff;
+      border-radius: 4px;
+      box-shadow: 0 2px 24px rgba(0,0,0,0.09);
+      cursor: grab;
+      touch-action: none;
+    }
+    #canvas.dragging { cursor: grabbing; }
+
+    #hint {
+      position: fixed;
+      bottom: 28px;
+      left: 50%;
+      transform: translateX(-50%);
+      font-family: Georgia, serif;
+      font-size: 13px;
+      color: rgba(80,70,60,0.55);
+      pointer-events: none;
+      transition: opacity 0.6s ease;
+      white-space: nowrap;
+    }
+    #hint.hidden { opacity: 0; }
+
+    #err {
+      display: none;
+      position: fixed;
+      top: 16px; left: 16px; right: 16px;
+      background: #fee; border: 1px solid #c00;
+      padding: 12px; border-radius: 4px;
+      font-family: monospace; font-size: 12px;
+      color: #900; white-space: pre-wrap;
+      z-index: 999;
+    }
+  </style>
+</head>
+<body>
+
+<canvas id="canvas"></canvas>
+<div id="hint">Click and drag to pull the text</div>
+<div id="err"></div>
+
+<script>
+// ─── Inline error display ───────────────────────────────────────────────────
+window.onerror = (msg, src, line, col, err) => {
+  const el = document.getElementById('err');
+  el.style.display = 'block';
+  el.textContent = `Error: ${msg}\n${src}:${line}:${col}`;
+};
+window.addEventListener('unhandledrejection', e => {
+  const el = document.getElementById('err');
+  el.style.display = 'block';
+  el.textContent = `Unhandled promise rejection:\n${e.reason}`;
+});
+</script>
+
+<script type="module">
+// ─── Load pretext dynamically so we can show a clear error if it fails ──────
+let prepareWithSegments, layoutWithLines;
+try {
+  const mod = await import('https://esm.sh/@chenglou/pretext');
+  prepareWithSegments = mod.prepareWithSegments;
+  layoutWithLines     = mod.layoutWithLines;
+} catch (e) {
+  document.getElementById('err').style.display = 'block';
+  document.getElementById('err').textContent =
+    `Failed to load pretext from CDN: ${e.message}\n\nTry opening via a local server:\n  python3 -m http.server 8080\nthen visit http://localhost:8080`;
+  throw e;
+}
+
+// ─── Config ─────────────────────────────────────────────────────────────────
+const FONT        = 'Georgia, serif';
+const FONT_SIZE   = 18;
+const FONT_STR    = `${FONT_SIZE}px ${FONT}`;  // must match exactly for pretext
+const LINE_HEIGHT = 32;
+const PAD_X       = 48;
+const PAD_Y       = 44;
+const GRAVITY     = 0.5;
+const SPRING_K    = 0.13;
+const DAMPING     = 0.2;
+const GRAB_RADIUS = 100;
+const CONSTRAINT_ITERS = 2;  // fewer = floppier rope
+
+const TEXT = `The old lighthouse keeper lit the lamp each night, not for ships—there were none—but for himself. The beam swept the dark water in slow, patient arcs, measuring out the hours until dawn. He had learned, long ago, that the sea does not care whether you watch it or not. But watching, he had decided, was its own kind of answer.`;
+
+// ─── Canvas setup ────────────────────────────────────────────────────────────
+const canvas = document.getElementById('canvas');
+const ctx    = canvas.getContext('2d');
+const CANVAS_W = Math.min(680, window.innerWidth - 48);
+canvas.width  = CANVAS_W;
+canvas.height = 300; // placeholder; updated after layout
+
+// ─── Text layout via pretext ─────────────────────────────────────────────────
+ctx.font = FONT_STR;
+const maxWidth = CANVAS_W - PAD_X * 2;
+
+const prepared = prepareWithSegments(TEXT, FONT_STR);
+const { lines, height: textHeight } = layoutWithLines(prepared, maxWidth, LINE_HEIGHT);
+
+canvas.height = textHeight + PAD_Y * 2;
+
+// Build word-particle rest positions.
+// Each word becomes one physics particle, drawn at its (x, y).
+const wordParticles = []; // { id, word, restX, restY, width }
+let pid = 0;
+
+for (let li = 0; li < lines.length; li++) {
+  const line    = lines[li];
+  const restY   = PAD_Y + li * LINE_HEIGHT + LINE_HEIGHT / 2;
+  const lineW   = line.width;
+  const lineX   = (CANVAS_W - lineW) / 2;  // centered
+
+  // Split line into words. Measure each word's width via canvas.
+  ctx.font = FONT_STR; // re-apply after possible canvas reset
+  const tokens = line.text.split(' ').filter(w => w.length > 0);
+  let curX = lineX;
+
+  for (let wi = 0; wi < tokens.length; wi++) {
+    const wordStr = wi < tokens.length - 1 ? tokens[wi] + ' ' : tokens[wi];
+    const w       = ctx.measureText(wordStr).width;
+    wordParticles.push({ id: pid++, word: wordStr, restX: curX, restY, width: w });
+    curX += w;
+  }
+}
+
+// ─── Physics particles ───────────────────────────────────────────────────────
+// Each particle: { id, x, y, prevX, prevY, restX, restY }
+const particles = wordParticles.map(({ id, restX, restY }) => ({
+  id, x: restX, y: restY, prevX: restX, prevY: restY, restX, restY,
+}));
+
+// Rope segment rest lengths (Euclidean distance between adjacent rest positions)
+const segments = [];
+for (let i = 0; i < particles.length - 1; i++) {
+  const a = particles[i], b = particles[i + 1];
+  const dx = b.restX - a.restX, dy = b.restY - a.restY;
+  segments.push({ a: i, b: i + 1, len: Math.sqrt(dx*dx + dy*dy) });
+}
+
+// ─── Physics state ───────────────────────────────────────────────────────────
+let state       = 'idle'; // 'idle' | 'dragging' | 'returning'
+let dragIdx     = -1;
+let dragDist    = 0;
+
+function startDrag(mx, my) {
+  let best = -1, bestD = GRAB_RADIUS;
+  for (let i = 0; i < particles.length; i++) {
+    const p = particles[i];
+    const d = Math.hypot(p.x - mx, p.y - my);
+    if (d < bestD) { bestD = d; best = i; }
+  }
+  if (best === -1) return false;
+
+  dragIdx = best;
+  state = 'dragging';
+  // Zero out all velocities at drag start.
+  for (const p of particles) { p.prevX = p.x; p.prevY = p.y; }
+  return true;
+}
+
+function updateDrag(mx, my) {
+  if (dragIdx === -1) return;
+  const p = particles[dragIdx];
+  p.x = mx; p.y = my;
+  dragDist = Math.hypot(mx - p.restX, my - p.restY);
+}
+
+function endDrag() {
+  dragIdx  = -1;
+  dragDist = 0;
+  state    = 'returning';
+}
+
+function satisfyConstraint(seg) {
+  const a = particles[seg.a], b = particles[seg.b];
+  const dx = b.x - a.x, dy = b.y - a.y;
+  const dist = Math.hypot(dx, dy) || 0.0001;
+  // 40% slack before correcting — gives the rope its loose, floppy feel.
+  if (dist < seg.len * 1.4) return;
+  const diff = (dist - seg.len) / dist;
+  const aFixed = seg.a === dragIdx;
+  const bFixed = seg.b === dragIdx;
+  if (aFixed && bFixed) return;
+  if (aFixed)      { b.x -= dx * diff;        b.y -= dy * diff; }
+  else if (bFixed) { a.x += dx * diff;        a.y += dy * diff; }
+  else             { a.x += dx*.5*diff; a.y += dy*.5*diff;
+                     b.x -= dx*.5*diff; b.y -= dy*.5*diff; }
+}
+
+function stepDragging() {
+  const n = particles.length;
+  // Activation radius grows fast — even a small drag pulls in many words.
+  const activationRadius = Math.max(6, dragDist / 2);
+
+  for (let i = 0; i < n; i++) {
+    if (i === dragIdx) continue;
+    const p = particles[i];
+    const indexDist  = Math.abs(i - dragIdx);
+    // activationFactor → 1 = full rope physics, 0 = strong spring to rest
+    const af = Math.max(0, 1 - Math.max(0, indexDist - 1) / activationRadius);
+
+    const vx = (p.x - p.prevX) * 0.82;  // heavy damping kills the jiggle
+    const vy = (p.y - p.prevY) * 0.82;
+    p.prevX = p.x; p.prevY = p.y;
+
+    const spring = 0.08 * (1 - af);  // weaker hold on the outer words
+    p.x += vx + (p.restX - p.x) * spring;
+    p.y += vy + (p.restY - p.y) * spring + GRAVITY * af;
+  }
+
+  for (let iter = 0; iter < CONSTRAINT_ITERS; iter++) {
+    for (const seg of segments) satisfyConstraint(seg);
+  }
+
+  // Keep dragged particle's velocity tracking current so release is smooth.
+  if (dragIdx !== -1) {
+    const dp = particles[dragIdx];
+    dp.prevX = dp.x; dp.prevY = dp.y;
+  }
+}
+
+function stepReturning() {
+  let settled = true;
+
+  for (const p of particles) {
+    const vx = (p.x - p.prevX) * DAMPING;
+    const vy = (p.y - p.prevY) * DAMPING;
+    const ax = (p.restX - p.x) * SPRING_K;
+    const ay = (p.restY - p.y) * SPRING_K;
+    p.prevX = p.x; p.prevY = p.y;
+    p.x += vx + ax;
+    p.y += vy + ay;
+
+    const dx = p.x - p.restX, dy = p.y - p.restY;
+    if (Math.hypot(dx, dy) > 0.4 || Math.abs(vx+ax) + Math.abs(vy+ay) > 0.08) {
+      settled = false;
+    }
+  }
+
+  if (settled) {
+    for (const p of particles) {
+      p.x = p.restX; p.y = p.restY; p.prevX = p.restX; p.prevY = p.restY;
+    }
+    state = 'idle';
+  }
+}
+
+function physicsStep() {
+  if (state === 'dragging')  stepDragging();
+  if (state === 'returning') stepReturning();
+}
+
+// ─── Rendering ───────────────────────────────────────────────────────────────
+function render() {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  ctx.font = FONT_STR;
+  ctx.textBaseline = 'middle';
+  ctx.textAlign    = 'left';
+
+  if (state === 'idle') {
+    ctx.fillStyle = 'rgb(28, 22, 16)';
+    for (const wp of wordParticles) {
+      ctx.fillText(wp.word, wp.restX, wp.restY);
+    }
+    return;
+  }
+
+  // Build position lookup from live particle array.
+  const pos = new Array(particles.length);
+  for (const p of particles) pos[p.id] = p;
+
+  // ── Rope line behind words ─────────────────────────────────────────────
+  // Gather displaced word centers for a smooth bezier path.
+  const pts = [];
+  for (let i = 0; i < wordParticles.length; i++) {
+    const wp = wordParticles[i];
+    const p  = pos[wp.id];
+    const dx = p.x - wp.restX, dy = p.y - wp.restY;
+    if (Math.hypot(dx, dy) > 1.5) {
+      pts.push({ x: p.x + wp.width / 2, y: p.y });
+    }
+  }
+  if (pts.length >= 2) {
+    ctx.save();
+    ctx.strokeStyle = 'rgba(100,78,55,0.22)';
+    ctx.lineWidth   = 2.5;
+    ctx.lineCap     = 'round';
+    ctx.lineJoin    = 'round';
+    ctx.beginPath();
+    ctx.moveTo(pts[0].x, pts[0].y);
+    for (let i = 0; i < pts.length - 1; i++) {
+      const mx = (pts[i].x + pts[i+1].x) / 2;
+      const my = (pts[i].y + pts[i+1].y) / 2;
+      ctx.quadraticCurveTo(pts[i].x, pts[i].y, mx, my);
+    }
+    ctx.lineTo(pts[pts.length-1].x, pts[pts.length-1].y);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  // ── Words ──────────────────────────────────────────────────────────────
+  for (const wp of wordParticles) {
+    const p  = pos[wp.id];
+    const dx = p.x - wp.restX;
+    const dy = p.y - wp.restY;
+    const disp = Math.hypot(dx, dy);
+
+    ctx.save();
+
+    if (disp > 4) {
+      // Tilt word in the direction it has moved (clamped to ±0.28 rad).
+      const angle = Math.atan2(dy, dx);
+      const tilt  = Math.max(-0.28, Math.min(0.28, angle * 0.4));
+      const cx    = p.x + wp.width / 2;
+      ctx.translate(cx, p.y);
+      ctx.rotate(tilt);
+      ctx.translate(-cx, -p.y);
+
+      // Shadow pass for visual depth.
+      ctx.fillStyle = 'rgba(28,22,16,0.15)';
+      ctx.fillText(wp.word, p.x + 1, p.y + 1);
+    }
+
+    ctx.fillStyle = 'rgb(28,22,16)';
+    ctx.fillText(wp.word, p.x, p.y);
+    ctx.restore();
+  }
+}
+
+// ─── Input ───────────────────────────────────────────────────────────────────
+const hint      = document.getElementById('hint');
+let   dragging  = false;
+let   hintGone  = false;
+
+function pt(e) {
+  const r   = canvas.getBoundingClientRect();
+  const src = e.touches ? e.touches[0] : e;
+  return { x: src.clientX - r.left, y: src.clientY - r.top };
+}
+
+canvas.addEventListener('mousedown', e => {
+  const { x, y } = pt(e);
+  if (startDrag(x, y)) {
+    dragging = true;
+    canvas.classList.add('dragging');
+    if (!hintGone) { hint.classList.add('hidden'); hintGone = true; }
+  }
+});
+window.addEventListener('mousemove', e => {
+  if (!dragging) return;
+  const { x, y } = pt(e);
+  updateDrag(x, y);
+});
+window.addEventListener('mouseup', () => {
+  if (!dragging) return;
+  dragging = false;
+  canvas.classList.remove('dragging');
+  endDrag();
+});
+
+canvas.addEventListener('touchstart', e => {
+  const { x, y } = pt(e);
+  if (startDrag(x, y)) {
+    dragging = true;
+    if (!hintGone) { hint.classList.add('hidden'); hintGone = true; }
+  }
+}, { passive: true });
+window.addEventListener('touchmove', e => {
+  if (!dragging) return;
+  e.preventDefault();
+  const { x, y } = pt(e);
+  updateDrag(x, y);
+}, { passive: false });
+window.addEventListener('touchend', () => {
+  if (!dragging) return;
+  dragging = false;
+  endDrag();
+});
+
+// ─── Loop ────────────────────────────────────────────────────────────────────
+function frame() {
+  physicsStep();
+  render();
+  requestAnimationFrame(frame);
+}
+
+render(); // initial paint
+requestAnimationFrame(frame);
+</script>
+
+</body>
+</html>
